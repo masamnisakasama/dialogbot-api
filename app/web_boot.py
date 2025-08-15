@@ -1,6 +1,5 @@
 # app/web_boot.py
 from __future__ import annotations
-
 import sys
 from pathlib import Path
 
@@ -11,7 +10,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=(Path(__file__).resolve().parent / ".env"))
 
-
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +17,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import os, json, re, time
 from uuid import uuid4
 from typing import Callable, Awaitable, List, Dict
-
 from app.main import app as _app
 
 # _appインポート後にルータを登録したあとに追加しないとエラー
@@ -109,6 +106,74 @@ async def _preflight_any(rest_of_path: str, request: Request):
 TARGET_PATHS = {"/stt-full", "/stt-full/"}
 USER_HEADER  = "x-user-id"
 
+
+# class STTS3Middleware(BaseHTTPMiddleware):
+#    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+#        if request.url.path not in TARGET_PATHS:
+#            return await call_next(request)
+#
+#        user_id = request.headers.get(USER_HEADER, request.headers.get("x-user", "web-client"))
+#
+#        body = await request.body()
+#           request._body = body  # type: ignore[attr-defined]
+#        except Exception:
+#            pass
+#
+#        response = await call_next(request)
+#
+#        resp_bytes = b""
+#        try:
+#            if isinstance(response, StreamingResponse) and not isinstance(response, JSONResponse):
+#                chunks = [chunk async for chunk in response.body_iterator]
+#                resp_bytes = b"".join(chunks)
+#                response = Response(
+#                    content=resp_bytes,
+#                    status_code=response.status_code,
+#                    headers=dict(response.headers),
+#                    media_type=response.media_type,
+#                )
+#            else:
+#                resp_bytes = await response.body()
+#        except Exception:
+#            pass
+#
+#        if _S3_AVAILABLE:
+#            try:
+#                date_prefix = time.strftime("%Y/%m/%d")
+#                base = f"{user_id}/{date_prefix}/{uuid4().hex}"
+#
+#                if body:
+#                    put_bytes_user(user_id, body, f"{base}.rawreq", "application/octet-stream")
+#
+#                if resp_bytes:
+#                    try:
+#                        result_obj = json.loads(resp_bytes.decode("utf-8"))
+#                    except Exception:
+#                        put_bytes_user(user_id, resp_bytes, f"{base}.result.bin", "application/octet-stream")
+#                    else:
+#                        put_json_user(user_id, result_obj, f"{base}.result.json")
+#                        text = (
+#                            result_obj.get("text")
+#                            or result_obj.get("transcript")
+#                            or result_obj.get("result", {}).get("text")
+#                        )
+#                        if isinstance(text, str) and text.strip():
+#                            put_text_user(user_id, text, f"{base}.txt")
+#
+#                        metrics = (
+#                            result_obj.get("metrics")
+#                            or result_obj.get("audio_metrics")
+#                            or result_obj.get("scores")
+#                        )
+#                        if isinstance(metrics, dict):
+#                            put_json_user(user_id, metrics, f"{base}.metrics.json")
+#            except Exception:
+#                pass
+#
+#        return response
+#
+#_app.add_middleware(STTS3Middleware)
+
 class STTS3Middleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         if request.url.path not in TARGET_PATHS:
@@ -116,17 +181,23 @@ class STTS3Middleware(BaseHTTPMiddleware):
 
         user_id = request.headers.get(USER_HEADER, request.headers.get("x-user", "web-client"))
 
-        body = await request.body()
-        try:
-            request._body = body  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        # raw リクエストは必要なときだけ保存（大きな音声でメモリを食わないように）
+        want_raw = os.getenv("STT_LOG_RAW", "0") == "1"
+        body = b""
+        if want_raw:
+            body = await request.body()
+            try:
+                request._body = body  # Starlette がもう一度読めるように
+            except Exception:
+                pass
 
         response = await call_next(request)
 
+        # --- レスポンス bytes を安全に取り出す（JSONResponse / StreamingResponse 両対応） ---
         resp_bytes = b""
         try:
-            if isinstance(response, StreamingResponse) and not isinstance(response, JSONResponse):
+            resp_bytes = getattr(response, "body", b"") or b""
+            if not resp_bytes:
                 chunks = [chunk async for chunk in response.body_iterator]
                 resp_bytes = b"".join(chunks)
                 response = Response(
@@ -135,8 +206,6 @@ class STTS3Middleware(BaseHTTPMiddleware):
                     headers=dict(response.headers),
                     media_type=response.media_type,
                 )
-            else:
-                resp_bytes = await response.body()
         except Exception:
             pass
 
@@ -145,7 +214,7 @@ class STTS3Middleware(BaseHTTPMiddleware):
                 date_prefix = time.strftime("%Y/%m/%d")
                 base = f"{user_id}/{date_prefix}/{uuid4().hex}"
 
-                if body:
+                if want_raw and body:
                     put_bytes_user(user_id, body, f"{base}.rawreq", "application/octet-stream")
 
                 if resp_bytes:
@@ -169,13 +238,13 @@ class STTS3Middleware(BaseHTTPMiddleware):
                             or result_obj.get("scores")
                         )
                         if isinstance(metrics, dict):
+                            # フロントの表記ゆれに合わせて両方出す（安全策）
                             put_json_user(user_id, metrics, f"{base}.metrics.json")
+                            put_json_user(user_id, metrics, f"{base}.audio_metrics.json")
             except Exception:
                 pass
 
         return response
-
-_app.add_middleware(STTS3Middleware)
 
 # =========================
 # /analyze-logic　既存が無い場合の補助で、ヒューリスティック的なやつ
